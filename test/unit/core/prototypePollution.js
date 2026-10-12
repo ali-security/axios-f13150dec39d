@@ -1,13 +1,28 @@
 'use strict';
 
 import assert from 'assert';
+import http from 'http';
+import axios from '../../../index.js';
 import utils from '../../../lib/utils.js';
 import mergeConfig from '../../../lib/core/mergeConfig.js';
+import defaults from '../../../lib/defaults/index.js';
+import AxiosHeaders from '../../../lib/core/AxiosHeaders.js';
+import httpAdapter from '../../../lib/adapters/http.js';
 
 describe('Prototype Pollution Protection', function () {
   afterEach(function () {
     // Clean up any pollution that might have occurred
     delete Object.prototype.polluted;
+    delete Object.prototype.transport;
+    delete Object.prototype.transformRequest;
+    delete Object.prototype.transformResponse;
+    delete Object.prototype.formSerializer;
+    delete Object.prototype.env;
+    delete Object.prototype.parseReviver;
+    delete Object.prototype.headers;
+    delete Object.prototype.responseType;
+    delete Object.prototype.transitional;
+    delete Object.prototype.httpVersion;
   });
 
   describe('utils.merge', function () {
@@ -178,6 +193,108 @@ describe('Prototype Pollution Protection', function () {
       assert.strictEqual(result.customProp.hasOwnProperty('__proto__'), false);
     });
 
+    it('should not inherit transport from Object.prototype', function () {
+      Object.prototype.transport = { request: function () {} };
+      const result = mergeConfig({}, { url: '/a' });
+      assert.strictEqual(result.hasOwnProperty('transport'), false);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transport'), false);
+    });
+
+    it('should not inherit transformRequest from Object.prototype', function () {
+      Object.prototype.transformRequest = function () {
+        return 'hijacked';
+      };
+      const result = mergeConfig({}, { url: '/a' });
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transformRequest'), false);
+    });
+
+    it('should not inherit transformResponse from Object.prototype', function () {
+      Object.prototype.transformResponse = function () {
+        return 'hijacked';
+      };
+      const result = mergeConfig({}, { url: '/a' });
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transformResponse'), false);
+    });
+
+    it('should not inherit arbitrary keys from Object.prototype', function () {
+      Object.prototype.polluted = 'yes';
+      const result = mergeConfig({}, { url: '/a' });
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'polluted'), false);
+    });
+
+    it('should not let a polluted transformRequest replace the default one', function () {
+      const safeTransform = function safeTransform(data) {
+        return data;
+      };
+      const hijack = function hijack() {
+        return 'hijacked';
+      };
+      Object.prototype.transformRequest = [hijack];
+
+      // config2 (the per-request config) has no own transformRequest
+      const result = mergeConfig({ transformRequest: [safeTransform] }, { url: '/a' });
+
+      assert.ok(Array.isArray(result.transformRequest));
+      assert.strictEqual(result.transformRequest.length, 1);
+      assert.strictEqual(result.transformRequest[0], safeTransform);
+      assert.notStrictEqual(result.transformRequest[0], hijack);
+    });
+
+    it('should not let a polluted transformResponse replace the default one', function () {
+      const safeTransform = function safeTransform(data) {
+        return data;
+      };
+      const hijack = function hijack() {
+        return 'hijacked';
+      };
+      Object.prototype.transformResponse = [hijack];
+
+      const result = mergeConfig({ transformResponse: [safeTransform] }, { url: '/a' });
+
+      assert.ok(Array.isArray(result.transformResponse));
+      assert.strictEqual(result.transformResponse.length, 1);
+      assert.strictEqual(result.transformResponse[0], safeTransform);
+      assert.notStrictEqual(result.transformResponse[0], hijack);
+    });
+
+    it('should not copy a polluted transport from the config that lacks it', function () {
+      const evilTransport = { request: function () {} };
+      Object.prototype.transport = evilTransport;
+
+      // the key is own (but undefined) on config2, config1 only inherits it
+      const result = mergeConfig({}, { url: '/a', transport: undefined });
+
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transport'), false);
+    });
+
+    it('should not let a polluted transport override an own transport', function () {
+      const safeRequest = function safeRequest() {};
+      const evilRequest = function evilRequest() {};
+      Object.prototype.transport = { request: evilRequest };
+
+      const result = mergeConfig({ transport: { request: safeRequest } }, { url: '/a' });
+
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transport'), true);
+      assert.strictEqual(result.transport.request, safeRequest);
+      assert.notStrictEqual(result.transport.request, evilRequest);
+    });
+
+    it('should not merge polluted headers into own headers', function () {
+      Object.prototype.headers = { 'X-Injected': 'evil', Authorization: 'Bearer attacker' };
+
+      const result = mergeConfig(
+        { headers: { common: { Accept: 'application/json' } } },
+        { url: '/a' }
+      );
+
+      assert.strictEqual(result.headers.common.Accept, 'application/json');
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result.headers, 'X-Injected'), false);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result.headers, 'Authorization'),
+        false
+      );
+    });
+
     it('should still merge configs correctly', function () {
       const config1 = {
         baseURL: 'https://api.example.com',
@@ -206,6 +323,230 @@ describe('Prototype Pollution Protection', function () {
       assert.strictEqual(result.timeout, 5000);
       assert.strictEqual(result.headers.common.Accept, 'application/json');
       assert.strictEqual(result.headers.common['Content-Type'], 'application/json');
+    });
+  });
+
+  describe('default transforms', function () {
+    const transformRequest = defaults.transformRequest[0];
+    const transformResponse = defaults.transformResponse[0];
+
+    it('should not apply a polluted parseReviver to JSON responses', function () {
+      const seen = [];
+      Object.prototype.parseReviver = function (key, value) {
+        seen.push(key);
+        if (key === 'role') return 'admin';
+        if (key === 'balance') return 999999;
+        return value;
+      };
+
+      const result = transformResponse.call({}, '{"role":"user","balance":10}');
+
+      delete Object.prototype.parseReviver;
+      assert.strictEqual(seen.length, 0);
+      assert.deepStrictEqual(result, { role: 'user', balance: 10 });
+    });
+
+    it('should not read a polluted responseType when transforming responses', function () {
+      Object.prototype.responseType = 'text';
+
+      const result = transformResponse.call({}, '{"a":1}');
+
+      delete Object.prototype.responseType;
+      assert.deepStrictEqual(result, { a: 1 });
+    });
+
+    it('should not read polluted transitional options when transforming responses', function () {
+      Object.prototype.transitional = { forcedJSONParsing: false, silentJSONParsing: true };
+
+      const result = transformResponse.call({}, '{"a":1}');
+
+      delete Object.prototype.transitional;
+      assert.deepStrictEqual(result, { a: 1 });
+    });
+
+    it('should not use a polluted formSerializer for urlencoded payloads', function () {
+      let visited = false;
+      Object.prototype.formSerializer = {
+        visitor: function (value, key) {
+          visited = true;
+          this.append('injected', 'evil');
+          return false;
+        },
+      };
+
+      const headers = new AxiosHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' });
+      const result = transformRequest.call({}, { a: 'b' }, headers);
+
+      delete Object.prototype.formSerializer;
+      assert.strictEqual(visited, false);
+      assert.strictEqual(result, 'a=b');
+    });
+
+    it('should not construct a polluted env.FormData for multipart payloads', function () {
+      let constructed = false;
+      function EvilFormData() {
+        constructed = true;
+      }
+      Object.prototype.env = { FormData: EvilFormData };
+
+      const headers = new AxiosHeaders({ 'Content-Type': 'multipart/form-data' });
+      let result;
+      let error;
+
+      try {
+        result = transformRequest.call({}, { a: 'b' }, headers);
+      } catch (err) {
+        error = err;
+      }
+
+      delete Object.prototype.env;
+      assert.strictEqual(constructed, false);
+      assert.strictEqual(error, undefined);
+      assert.ok(result && typeof result.append === 'function');
+      assert.ok(!(result instanceof EvilFormData));
+    });
+  });
+
+  describe('http adapter', function () {
+    const payload = { role: 'user', balance: 10 };
+    let server;
+    let baseURL;
+
+    before(function (done) {
+      server = http.createServer(function (req, res) {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Connection', 'close');
+        res.end(JSON.stringify(payload));
+      });
+
+      server.listen(0, '127.0.0.1', function () {
+        baseURL = 'http://127.0.0.1:' + server.address().port;
+        done();
+      });
+    });
+
+    after(function (done) {
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+      server.close(function () {
+        done();
+      });
+    });
+
+    it('should not let a polluted parseReviver tamper with JSON responses', async function () {
+      const seen = [];
+      Object.prototype.parseReviver = function (key, value) {
+        seen.push(key);
+        if (key === 'role') return 'admin';
+        if (key === 'balance') return 999999;
+        return value;
+      };
+
+      const res = await axios.get(baseURL + '/');
+
+      delete Object.prototype.parseReviver;
+      assert.strictEqual(seen.length, 0);
+      assert.deepStrictEqual(res.data, payload);
+    });
+
+    it('should not hand the request to a polluted transport', async function () {
+      let hijacked = null;
+      Object.prototype.transport = {
+        request: function (options) {
+          hijacked = options;
+          throw new Error('request hijacked');
+        },
+      };
+
+      const res = await axios.get(baseURL + '/', {
+        auth: { username: 'user', password: 'secret' },
+      });
+
+      delete Object.prototype.transport;
+      assert.strictEqual(hijacked, null);
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(res.data, payload);
+    });
+
+    it('should not read a polluted transport in the adapter', async function () {
+      let hijacked = null;
+      Object.prototype.transport = {
+        request: function (options) {
+          hijacked = options;
+          throw new Error('request hijacked');
+        },
+      };
+
+      const res = await httpAdapter({ url: baseURL + '/', method: 'get', headers: {} });
+
+      delete Object.prototype.transport;
+      assert.strictEqual(hijacked, null);
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(JSON.parse(res.data), payload);
+    });
+
+    it('should not read a polluted responseType in the adapter', async function () {
+      Object.prototype.responseType = 'stream';
+
+      const res = await httpAdapter({ url: baseURL + '/', method: 'get', headers: {} });
+
+      delete Object.prototype.responseType;
+      const data = res.data;
+      if (data && typeof data.destroy === 'function') {
+        data.destroy();
+      }
+      assert.strictEqual(typeof data, 'string');
+      assert.deepStrictEqual(JSON.parse(data), payload);
+    });
+
+    it('should not switch protocols on a polluted httpVersion', async function () {
+      Object.prototype.httpVersion = 2;
+
+      const res = await httpAdapter({
+        url: baseURL + '/',
+        method: 'get',
+        headers: {},
+        timeout: 5000,
+      });
+
+      delete Object.prototype.httpVersion;
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(JSON.parse(res.data), payload);
+    });
+
+    it('should not construct a polluted env.Blob for data: URIs', async function () {
+      let constructed = false;
+      function EvilBlob() {
+        constructed = true;
+      }
+      Object.prototype.env = { Blob: EvilBlob };
+
+      let res;
+      let error;
+
+      try {
+        res = await httpAdapter({
+          url: 'data:application/json;base64,eyJyb2xlIjoidXNlciJ9',
+          method: 'get',
+          headers: {},
+          responseType: 'blob',
+        });
+      } catch (err) {
+        error = err;
+      }
+
+      delete Object.prototype.env;
+      assert.strictEqual(constructed, false);
+
+      // Blob is only a global since Node 18; older runtimes reject with ERR_NOT_SUPPORT
+      if (typeof Blob !== 'undefined') {
+        assert.strictEqual(error, undefined);
+        assert.ok(res.data instanceof Blob);
+        assert.ok(!(res.data instanceof EvilBlob));
+      } else {
+        assert.ok(error);
+      }
     });
   });
 });
