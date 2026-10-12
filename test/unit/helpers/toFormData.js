@@ -18,6 +18,49 @@ describe('helpers::toFormData', function () {
     };
   }
   
+  it('should ignore a visitor inherited only from Object.prototype', function () {
+    let called = false;
+    Object.prototype.visitor = () => {
+      called = true;
+      return false;
+    };
+
+    try {
+      const formData = createRNFormDataSpy();
+      toFormData({ field: 'value' }, formData);
+
+      assert.strictEqual(called, false);
+      assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+    } finally {
+      delete Object.prototype.visitor;
+    }
+  });
+
+  it('should ignore maxDepth inherited only from Object.prototype', function () {
+    Object.prototype.maxDepth = 0;
+
+    try {
+      const formData = createRNFormDataSpy();
+      assert.doesNotThrow(() => toFormData({ nested: { field: 'value' } }, formData));
+      assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+    } finally {
+      delete Object.prototype.maxDepth;
+    }
+  });
+
+  it('should still honor own and template-inherited options', function () {
+    const formData = createRNFormDataSpy();
+    const options = Object.create({ dots: true });
+    options.metaTokens = false;
+
+    toFormData({ nested: { field: 'value' }, 'list{}': [1] }, formData, options);
+
+    assert.deepStrictEqual(formData.calls, [
+      ['nested.field', 'value'],
+      ['list', '[1]'],
+    ]);
+  });
+
   it('should convert a flat object to FormData', function () {
     const data = {
       foo: 'bar',

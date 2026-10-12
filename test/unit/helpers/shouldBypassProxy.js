@@ -24,6 +24,70 @@ afterEach(() => {
 });
 
 describe('helpers::shouldBypassProxy', function () {
+  describe('CIDR entries', function () {
+    it('should match IPv4 ranges and their prefix boundaries', function () {
+      setNoProxy('172.16.0.0/12');
+
+      assert.strictEqual(shouldBypassProxy('http://172.16.0.1/'), true);
+      assert.strictEqual(shouldBypassProxy('http://172.31.255.255/'), true);
+      assert.strictEqual(shouldBypassProxy('http://172.15.255.255/'), false);
+      assert.strictEqual(shouldBypassProxy('http://172.32.0.0/'), false);
+    });
+
+    it('should match bracketed and unbracketed IPv6 ranges', function () {
+      for (const entry of ['fd00::/8', '[fd00::]/8']) {
+        setNoProxy(entry);
+
+        assert.strictEqual(shouldBypassProxy('http://[fd12:3456::1]/'), true);
+        assert.strictEqual(shouldBypassProxy('http://[fe00::1]/'), false);
+      }
+    });
+
+    it('should translate IPv4-mapped IPv6 ranges', function () {
+      setNoProxy('::ffff:127.0.0.0/104');
+
+      assert.strictEqual(shouldBypassProxy('http://127.10.20.30/'), true);
+      assert.strictEqual(shouldBypassProxy('http://128.0.0.1/'), false);
+    });
+
+    it('should keep address families separate for zero-length prefixes', function () {
+      setNoProxy('0.0.0.0/0');
+
+      assert.strictEqual(shouldBypassProxy('http://203.0.113.7/'), true);
+      assert.strictEqual(shouldBypassProxy('http://[2001:db8::1]/'), false);
+
+      setNoProxy('::/0');
+
+      assert.strictEqual(shouldBypassProxy('http://[2001:db8::1]/'), true);
+      assert.strictEqual(shouldBypassProxy('http://203.0.113.7/'), false);
+    });
+
+    it('should match CIDR entries mixed with other no_proxy entries', function () {
+      setNoProxy('example.com, 10.0.0.0/8 ,localhost');
+
+      assert.strictEqual(shouldBypassProxy('http://10.20.30.40:8080/'), true);
+      assert.strictEqual(shouldBypassProxy('http://example.com/'), true);
+      assert.strictEqual(shouldBypassProxy('http://11.0.0.1/'), false);
+    });
+
+    it('should fail closed for malformed ranges', function () {
+      for (const entry of ['10.0.0.0/33', 'fd00::/129', 'example.com/24', '10.0.0.0/01']) {
+        setNoProxy(entry);
+
+        assert.strictEqual(shouldBypassProxy('http://10.0.0.1/'), false);
+        assert.strictEqual(shouldBypassProxy('http://[fd00::1]/'), false);
+      }
+    });
+  });
+
+  it('should handle a long non-matching dotted entry within the test timeout', function () {
+    this.timeout(1000);
+
+    setNoProxy(`example.com${'.'.repeat(100000)}invalid`);
+
+    assert.strictEqual(shouldBypassProxy('http://example.com/'), false);
+  });
+
   it('should bypass proxy for localhost with a trailing dot', function () {
     setNoProxy('localhost,127.0.0.1,::1');
     assert.strictEqual(shouldBypassProxy('http://localhost.:8080/'), true);

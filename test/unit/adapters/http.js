@@ -3240,6 +3240,85 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  describe('setProxy result', function () {
+    const buildDirectOptions = () => ({
+      headers: {},
+      beforeRedirects: {},
+      hostname: 'target.example',
+      host: 'target.example',
+      port: '4000',
+      protocol: 'http:',
+      path: '/resource',
+    });
+
+    it('should report proxy false as direct', function () {
+      const options = buildDirectOptions();
+
+      const proxyApplied = __setProxy(
+        options,
+        false,
+        'http://target.example:4000/resource',
+        false
+      );
+
+      assert.strictEqual(proxyApplied, false);
+      assert.strictEqual(options.hostname, 'target.example');
+      assert.strictEqual(options.port, '4000');
+      assert.strictEqual(options.path, '/resource');
+    });
+
+    it('should report an explicit proxy as applied', function () {
+      const options = buildDirectOptions();
+
+      const proxyApplied = __setProxy(
+        options,
+        { protocol: 'http', host: '127.0.0.1', port: 9000 },
+        'http://target.example:4000/resource',
+        false
+      );
+
+      assert.strictEqual(proxyApplied, true);
+      assert.strictEqual(options.hostname, '127.0.0.1');
+    });
+
+    it('should ignore environment proxies when they are not allowed for the transport', function () {
+      const originalHttpProxy = process.env.http_proxy;
+      const originalNoProxy = process.env.no_proxy;
+
+      process.env.http_proxy = 'http://proxy.local:9000';
+      process.env.no_proxy = '';
+
+      try {
+        const allowed = buildDirectOptions();
+        assert.strictEqual(
+          __setProxy(allowed, undefined, 'http://target.example:4000/resource', false),
+          true
+        );
+        assert.strictEqual(allowed.hostname, 'proxy.local');
+
+        const disallowed = buildDirectOptions();
+        assert.strictEqual(
+          __setProxy(disallowed, undefined, 'http://target.example:4000/resource', false, false),
+          false
+        );
+        assert.strictEqual(disallowed.hostname, 'target.example');
+        assert.strictEqual(disallowed.path, '/resource');
+      } finally {
+        if (originalHttpProxy === undefined) {
+          delete process.env.http_proxy;
+        } else {
+          process.env.http_proxy = originalHttpProxy;
+        }
+
+        if (originalNoProxy === undefined) {
+          delete process.env.no_proxy;
+        } else {
+          process.env.no_proxy = originalNoProxy;
+        }
+      }
+    });
+  });
+
   describe('HTTP2', function () {
     const LOCAL_SERVER_URL = 'https://127.0.0.1:4444';
 
@@ -3294,6 +3373,223 @@ describe('supports http with nodejs', function () {
       const { data } = await http2Axios.post(LOCAL_SERVER_URL, payload);
 
       assert.deepStrictEqual(data, payload);
+    });
+
+    it('should use a custom DNS lookup for HTTP/2 connections', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('OK');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      let lookupCalls = 0;
+
+      const { data } = await axios.get('https://custom-host.axios:4444/', {
+        httpVersion: 2,
+        proxy: false,
+        http2Options: {
+          rejectUnauthorized: false,
+        },
+        lookup: async () => {
+          lookupCalls++;
+          return '127.0.0.1';
+        },
+      });
+
+      assert.strictEqual(data, 'OK');
+      assert.ok(lookupCalls > 0);
+    });
+
+    it('should apply a blocking custom DNS lookup to HTTP/2 connections', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('unexpected');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      let lookupCalls = 0;
+
+      await assert.rejects(
+        axios.get('https://localhost:4444/', {
+          httpVersion: 2,
+          proxy: false,
+          http2Options: {
+            rejectUnauthorized: false,
+          },
+          lookup: (hostname, opt, cb) => {
+            lookupCalls++;
+            const err = new Error('blocked by DNS policy');
+            err.code = 'EPOLICY';
+            cb(err);
+          },
+        }),
+        (err) => {
+          // The lookup failure surfaces either directly or as the cause of the
+          // cancelled pending HTTP/2 stream.
+          assert.ok(
+            err.code === 'EPOLICY' || /blocked by DNS policy/.test(err.message),
+            `unexpected error: ${err.code} ${err.message}`
+          );
+          return true;
+        }
+      );
+
+      assert.ok(lookupCalls > 0);
+    });
+
+    it('should reuse an HTTP/2 session with the same custom DNS lookup', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('OK');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      let sessions = 0;
+      const lookup = async () => '127.0.0.1';
+
+      server.on('session', () => {
+        sessions++;
+      });
+
+      const instance = axios.create({
+        baseURL: 'https://custom-host.axios:4444',
+        httpVersion: 2,
+        proxy: false,
+        lookup,
+        http2Options: {
+          rejectUnauthorized: false,
+          sessionTimeout: 10000,
+        },
+      });
+
+      await instance.get('/one');
+      await instance.get('/two');
+
+      assert.strictEqual(sessions, 1);
+    });
+
+    it('should reject when an HTTP/2 request selects a proxy', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('unexpected');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      await assert.rejects(
+        http2Axios.get(LOCAL_SERVER_URL, {
+          proxy: {
+            protocol: 'http',
+            host: '127.0.0.1',
+            port: 1,
+          },
+        }),
+        (error) => {
+          assert.strictEqual(error.code, AxiosError.ERR_NOT_SUPPORT);
+          assert.ok(/HTTP\/2 requests with a proxy are not supported/.test(error.message));
+          return true;
+        }
+      );
+    });
+
+    it('should connect directly for HTTP/2 when only an environment proxy is configured', async () => {
+      const proxyEnvKeys = ['https_proxy', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY'];
+      const originalProxyEnv = Object.create(null);
+
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('OK');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      for (const key of proxyEnvKeys) {
+        originalProxyEnv[key] = process.env[key];
+      }
+
+      process.env.https_proxy = 'http://127.0.0.1:1';
+      process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+      process.env.no_proxy = '';
+      process.env.NO_PROXY = '';
+
+      try {
+        const { data } = await http2Axios.get(LOCAL_SERVER_URL);
+
+        assert.strictEqual(data, 'OK');
+      } finally {
+        for (const key of proxyEnvKeys) {
+          if (originalProxyEnv[key] === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = originalProxyEnv[key];
+          }
+        }
+      }
+    });
+
+    it('should honor proxy false for HTTP/2 with a proxyEnv agent', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('OK');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      const { data } = await http2Axios.get(LOCAL_SERVER_URL, {
+        proxy: false,
+        httpsAgent: new https.Agent({
+          proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:1' },
+        }),
+      });
+
+      assert.strictEqual(data, 'OK');
+    });
+
+    it('should connect directly for HTTP/2 when only the selected agent has proxyEnv', async () => {
+      server = await startHTTPServer(
+        (req, res) => {
+          res.end('OK');
+        },
+        {
+          useHTTP2: true,
+        }
+      );
+
+      const { data } = await http2Axios.get(LOCAL_SERVER_URL, {
+        httpsAgent: new https.Agent({
+          proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:1' },
+        }),
+      });
+
+      assert.strictEqual(data, 'OK');
+    });
+
+    it('should reject HTTP/2 connection failures without an uncaught session error', async () => {
+      await assert.rejects(
+        axios.get('https://127.0.0.1:1/', {
+          httpVersion: 2,
+          proxy: false,
+          timeout: 1000,
+          http2Options: {
+            rejectUnauthorized: false,
+          },
+        })
+      );
     });
 
     it('should enforce maxBodyLength for HTTP/2 streamed uploads', async function () {
