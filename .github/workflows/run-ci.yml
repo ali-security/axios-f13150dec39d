@@ -1,8 +1,12 @@
 name: Continuous integration
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional mocha --grep pattern to run a subset of unit tests'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -15,6 +19,7 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -33,14 +38,22 @@ jobs:
           cache: npm
       - name: Install dependencies
         if: matrix.node-version == '14.x'
-        run: npm i
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken 2026-02-27T15:35:51.983000Z
+          npm i
       - name: Install dependencies
         if: matrix.node-version != '14.x'
         run: npm ci
       - name: Build project
         run: npm run build
       - name: Run unit tests
-        run: npm run test:node
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm run test:node -- --grep "${{ inputs.test-filter }}"
+          else
+            npm run test:node
+          fi
       - name: Run package tests
         run: npm run test:package
       - name: Run browser tests
@@ -48,4 +61,14 @@ jobs:
         if: matrix.node-version == '24.x'
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
+        if: matrix.node-version == '24.x' && github.event_name == 'pull_request'
+      - name: Pack package
         if: matrix.node-version == '24.x'
+        run: npm pack
+      - name: Upload package tarball
+        if: matrix.node-version == '24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: axios-tgz
+          path: axios-1.13.6.tgz
+          if-no-files-found: error
