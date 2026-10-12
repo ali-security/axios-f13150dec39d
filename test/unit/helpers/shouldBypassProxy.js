@@ -39,6 +39,66 @@ describe('helpers::shouldBypassProxy', function () {
     assert.strictEqual(shouldBypassProxy('http://[::1]:8080/'), true);
   });
 
+  it('should bypass proxy for 0.0.0.0 when no_proxy contains a local entry', function () {
+    for (const entry of ['localhost', '127.0.0.1', '::1']) {
+      setNoProxy(entry);
+
+      assert.strictEqual(shouldBypassProxy('http://0.0.0.0:7777/'), true);
+    }
+  });
+
+  it('should respect explicit ports for 0.0.0.0 local matching', function () {
+    setNoProxy('localhost:8080');
+
+    assert.strictEqual(shouldBypassProxy('http://0.0.0.0:8080/'), true);
+    assert.strictEqual(shouldBypassProxy('http://0.0.0.0:9090/'), false);
+  });
+
+  it('should bypass proxy for the IPv6 unspecified address symmetrically with 0.0.0.0', function () {
+    for (const entry of ['localhost', '127.0.0.1', '::1']) {
+      setNoProxy(entry);
+
+      assert.strictEqual(shouldBypassProxy('http://[::]:7777/'), true);
+      assert.strictEqual(shouldBypassProxy('http://[0:0:0:0:0:0:0:0]:7777/'), true);
+    }
+  });
+
+  it('should bypass proxy for compressed IPv6 unspecified request forms', function () {
+    setNoProxy('localhost,127.0.0.1,::1');
+
+    for (const host of ['0::', '::0', '0:0::', '::0:0', '0::0']) {
+      assert.strictEqual(shouldBypassProxy(`http://[${host}]:7777/`), true);
+    }
+  });
+
+  it('should bypass proxy for compressed IPv6 unspecified no_proxy entries', function () {
+    for (const entry of ['0::', '::0', '0:0::', '::0:0', '0::0']) {
+      setNoProxy(entry);
+
+      assert.strictEqual(shouldBypassProxy('http://[::]:7777/'), true);
+      assert.strictEqual(shouldBypassProxy('http://[0:0:0:0:0:0:0:0]:7777/'), true);
+    }
+  });
+
+  it('should respect explicit ports on compressed IPv6 unspecified no_proxy entries', function () {
+    setNoProxy('[0::]:8080');
+
+    assert.strictEqual(shouldBypassProxy('http://[::]:8080/'), true);
+    assert.strictEqual(shouldBypassProxy('http://[::]:9090/'), false);
+  });
+
+  it('should not treat nonzero compressed IPv6 addresses as unspecified', function () {
+    setNoProxy('0::2');
+
+    assert.strictEqual(shouldBypassProxy('http://[::]:7777/'), false);
+  });
+
+  it('should still route a real public IPv6 host through the proxy', function () {
+    setNoProxy('localhost');
+
+    assert.strictEqual(shouldBypassProxy('http://[2001:db8::1]:7777/'), false);
+  });
+
   it('should match wildcard and explicit ports', function () {
     setNoProxy('*.example.com,localhost:8080');
     assert.strictEqual(shouldBypassProxy('http://api.example.com/'), true);

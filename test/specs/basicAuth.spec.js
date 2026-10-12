@@ -63,6 +63,35 @@ describe('basicAuth', function () {
     }, 100);
   });
 
+  it('should ignore inherited nested auth fields', function (done) {
+    Object.defineProperty(Object.prototype, 'username', {
+      value: 'inherited-user',
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, 'password', {
+      value: 'inherited-pass',
+      writable: true,
+      configurable: true,
+    });
+
+    axios('/foo', {
+      auth: {},
+    });
+
+    setTimeout(function () {
+      try {
+        const request = jasmine.Ajax.requests.mostRecent();
+
+        expect(request.requestHeaders['Authorization']).toEqual('Basic Og==');
+      } finally {
+        delete Object.prototype.username;
+        delete Object.prototype.password;
+      }
+      done();
+    }, 100);
+  });
+
   it('should fail to encode HTTP Basic auth credentials with non-Latin1 characters in username', function (done) {
     axios('/foo', {
       auth: {

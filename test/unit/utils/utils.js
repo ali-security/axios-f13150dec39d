@@ -173,4 +173,107 @@ describe('utils', function () {
       assert.strictEqual(utils.isReactNative({}), false);
     });
   });
+
+  describe('prototype-pollution-safe type checks', function () {
+    afterEach(function () {
+      delete Object.prototype[Symbol.iterator];
+      delete Object.prototype[Symbol.toStringTag];
+    });
+
+    it('should ignore inherited symbol properties when validating plain Object', function () {
+      Object.prototype[Symbol.iterator] = function* () {
+        yield ['x-injected', 'yes'];
+      };
+      Object.prototype[Symbol.toStringTag] = 'Custom';
+
+      assert.strictEqual(utils.isPlainObject({}), true);
+      assert.strictEqual(utils.isPlainObject([]), false);
+      assert.strictEqual(
+        utils.isPlainObject({
+          [Symbol.iterator]: function* () {
+            yield ['x-own', 'yes'];
+          },
+        }),
+        false
+      );
+      assert.strictEqual(
+        utils.isPlainObject({
+          [Symbol.toStringTag]: 'Custom',
+        }),
+        false
+      );
+    });
+
+    it('should treat an object with a genuinely inherited iterator as non-plain', function () {
+      // Iterator inherited from a custom (non-Object.prototype) source: this is a
+      // real iterable, not prototype pollution, so it must not be classified plain.
+      const proto = Object.create(null);
+      proto[Symbol.iterator] = function* () {
+        yield ['x', '1'];
+      };
+
+      assert.strictEqual(utils.isPlainObject(Object.create(proto)), false);
+    });
+
+    it('should not read polluted Object.prototype iterator accessors for safe iterable checks', function () {
+      let accessed = false;
+
+      Object.defineProperty(Object.prototype, Symbol.iterator, {
+        configurable: true,
+        get() {
+          accessed = true;
+          throw new Error('polluted iterator accessor');
+        },
+      });
+
+      assert.strictEqual(utils.isSafeIterable({}), false);
+      assert.strictEqual(accessed, false);
+    });
+
+    it('should accept genuine iterables in safe iterable checks', function () {
+      assert.strictEqual(utils.isSafeIterable(new Map([['x', '1']])), true);
+      assert.strictEqual(utils.isSafeIterable([['x', '1']]), true);
+      assert.strictEqual(utils.isSafeIterable({}), false);
+      assert.strictEqual(utils.isSafeIterable(null), false);
+    });
+
+    it('should stop safe prototype-chain reads on cyclic Proxy prototypes', function () {
+      let calls = 0;
+      let proxy;
+      proxy = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            calls += 1;
+            if (calls > 5) {
+              throw new Error('cycled');
+            }
+            return proxy;
+          },
+        }
+      );
+
+      assert.strictEqual(utils.hasOwnInPrototypeChain(proxy, 'missing'), false);
+      assert.strictEqual(utils.getSafeProp(proxy, 'missing'), undefined);
+      assert.ok(calls <= 2, 'prototype walk must stop on the first repeated prototype');
+    });
+
+    it('should read own and template-inherited props but ignore polluted Object.prototype props', function () {
+      Object.prototype.pollutedSafeProp = 'polluted';
+
+      try {
+        const template = { inherited: 'template' };
+        const obj = Object.create(template);
+        obj.own = 'own';
+
+        assert.strictEqual(utils.getSafeProp(obj, 'own'), 'own');
+        assert.strictEqual(utils.getSafeProp(obj, 'inherited'), 'template');
+        assert.strictEqual(utils.getSafeProp(obj, 'pollutedSafeProp'), undefined);
+        assert.strictEqual(utils.getSafeProp({}, 'pollutedSafeProp'), undefined);
+        assert.strictEqual(utils.getSafeProp(null, 'own'), undefined);
+      } finally {
+        delete Object.prototype.pollutedSafeProp;
+      }
+    });
+  });
 });
