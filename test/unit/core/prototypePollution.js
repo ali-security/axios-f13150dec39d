@@ -24,6 +24,29 @@ describe('Prototype Pollution Protection', function () {
     delete Object.prototype.transitional;
     delete Object.prototype.httpVersion;
     delete Object.prototype.validateStatus;
+    delete Object.prototype.auth;
+    delete Object.prototype.baseURL;
+    delete Object.prototype.socketPath;
+    delete Object.prototype.beforeRedirect;
+    delete Object.prototype.insecureHTTPParser;
+    delete Object.prototype.adapter;
+    delete Object.prototype.httpAgent;
+    delete Object.prototype.httpsAgent;
+    delete Object.prototype.proxy;
+    delete Object.prototype.maxContentLength;
+    delete Object.prototype.maxBodyLength;
+    delete Object.prototype.maxRedirects;
+    delete Object.prototype.maxRate;
+    delete Object.prototype.timeout;
+    delete Object.prototype.timeoutErrorMessage;
+    delete Object.prototype.cancelToken;
+    delete Object.prototype.signal;
+    delete Object.prototype.decompress;
+    delete Object.prototype.params;
+    delete Object.prototype.paramsSerializer;
+    delete Object.prototype.method;
+    delete Object.prototype.withCredentials;
+    delete Object.prototype.fetchOptions;
   });
 
   describe('utils.merge', function () {
@@ -579,6 +602,185 @@ describe('Prototype Pollution Protection', function () {
       } finally {
         await new Promise((resolve) => server.close(resolve));
       }
+    });
+  });
+
+  describe('GHSA-q8qp-cvcw-x6jj http adapter gadgets', function () {
+    function startServer(handler) {
+      return new Promise((resolve) => {
+        const server = http.createServer(handler || ((req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ headers: req.headers, url: req.url }));
+        }));
+        server.listen(0, '127.0.0.1', () => resolve(server));
+      });
+    }
+    function stopServer(server) {
+      return new Promise((resolve) => server.close(resolve));
+    }
+
+    it('should not pick up Object.prototype.auth as an Authorization header', async function () {
+      this.timeout(10000);
+      Object.prototype.auth = { username: 'attacker', password: 'exfil' };
+      const server = await startServer();
+      const { port } = server.address();
+      try {
+        const res = await axios.get(`http://127.0.0.1:${port}/api`);
+        assert.strictEqual(res.data.headers.authorization, undefined);
+      } finally { await stopServer(server); }
+    });
+
+    it('should not pick up Object.prototype.socketPath', async function () {
+      const major = parseInt(process.versions.node.split('.')[0], 10);
+      if (major < 16) this.skip();
+      this.timeout(10000);
+      Object.prototype.socketPath = '/tmp/axios-should-never-be-used.sock';
+      const server = await startServer();
+      const { port } = server.address();
+      try {
+        const res = await axios.get(`http://127.0.0.1:${port}/api`);
+        assert.strictEqual(res.status, 200);
+      } finally { await stopServer(server); }
+    });
+
+    it('should not invoke Object.prototype.beforeRedirect during redirects', async function () {
+      this.timeout(10000);
+      let hijackCalled = false;
+      Object.prototype.beforeRedirect = function () { hijackCalled = true; };
+      const target = await startServer();
+      const { port: targetPort } = target.address();
+      const redirector = await startServer((req, res) => {
+        res.writeHead(302, { Location: `http://127.0.0.1:${targetPort}/final` });
+        res.end();
+      });
+      const { port: redirectorPort } = redirector.address();
+      try {
+        await axios.get(`http://127.0.0.1:${redirectorPort}/start`);
+        assert.strictEqual(hijackCalled, false);
+      } finally {
+        await stopServer(redirector);
+        await stopServer(target);
+      }
+    });
+
+    it('should not enable insecureHTTPParser via Object.prototype', async function () {
+      this.timeout(10000);
+      Object.prototype.insecureHTTPParser = true;
+      const net = await import('net');
+      // A control character in a header value is rejected by Node's strict HTTP parser on every
+      // supported Node version, but accepted once insecureHTTPParser is enabled.
+      const payload =
+        'HTTP/1.1 200 OK\r\n' +
+        'Content-Type: application/json\r\n' +
+        'X-Smuggle: bad\u0001value\r\n' +
+        'Content-Length: 2\r\n' +
+        'Connection: close\r\n' +
+        '\r\n' +
+        '{}';
+      const malformed = await new Promise((resolve) => {
+        const srv = net.createServer((socket) => { socket.once('data', () => socket.end(payload)); });
+        srv.listen(0, '127.0.0.1', () => resolve(srv));
+      });
+      const { port } = malformed.address();
+      try {
+        let threw = false;
+        try { await axios.get(`http://127.0.0.1:${port}/`); } catch (err) { threw = true; }
+        assert.strictEqual(threw, true, 'request should be rejected by the strict HTTP parser');
+      } finally { await new Promise((resolve) => malformed.close(resolve)); }
+    });
+  });
+
+  describe('GHSA-q8qp-cvcw-x6jj resolveConfig baseURL gadget', function () {
+    it('should not hijack relative-URL requests via Object.prototype.baseURL', async function () {
+      this.timeout(10000);
+      let hijackHit = false;
+      const hijacker = http.createServer((req, res) => { hijackHit = true; res.writeHead(200); res.end('{"hijacked":true}'); });
+      await new Promise((resolve) => hijacker.listen(0, '127.0.0.1', resolve));
+      Object.prototype.baseURL = `http://127.0.0.1:${hijacker.address().port}`;
+      try {
+        let threw = false;
+        try { await axios.get('/api'); } catch (_) { threw = true; }
+        assert.strictEqual(hijackHit, false);
+        assert.strictEqual(threw, true);
+      } finally { await new Promise((resolve) => hijacker.close(resolve)); }
+    });
+  });
+
+  describe('mergeConfig null-prototype structural defense', function () {
+    it('should return an object whose prototype is null', function () {
+      const merged = mergeConfig({ url: '/x' }, { method: 'get' });
+      assert.strictEqual(Object.getPrototypeOf(merged), null);
+    });
+
+    it('should preserve hasOwnProperty as a callable own slot', function () {
+      const merged = mergeConfig({}, { url: '/x', method: 'get' });
+      assert.strictEqual(typeof merged.hasOwnProperty, 'function');
+      assert.strictEqual(merged.hasOwnProperty('url'), true);
+      assert.strictEqual(merged.hasOwnProperty('bogus'), false);
+    });
+
+    it('should not expose arbitrary polluted keys as inherited properties', function () {
+      Object.prototype.polluted = 'attacker';
+      try {
+        const merged = mergeConfig({ url: '/x' }, {});
+        assert.strictEqual(merged.polluted, undefined);
+      } finally { delete Object.prototype.polluted; }
+    });
+  });
+
+  describe('Full gadget coverage via null-prototype config', function () {
+    function startEcho(handler) {
+      return new Promise((resolve) => {
+        const server = http.createServer(handler || ((req, res) => {
+          let body = '';
+          req.on('data', (c) => (body += c));
+          req.on('end', () => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ url: req.url, method: req.method, headers: req.headers, body }));
+          });
+        }));
+        server.listen(0, '127.0.0.1', () => resolve(server));
+      });
+    }
+    const stop = (s) => new Promise((r) => s.close(r));
+
+    it('should ignore polluted adapter', async function () {
+      this.timeout(10000);
+      let hijacked = false;
+      Object.prototype.adapter = function () { hijacked = true; return Promise.resolve({ data: 'pwned', status: 200, statusText: 'OK', headers: {}, config: {}, request: {} }); };
+      const server = await startEcho();
+      const { port } = server.address();
+      try { const res = await axios.get(`http://127.0.0.1:${port}/ok`); assert.strictEqual(hijacked, false); } finally { await stop(server); }
+    });
+
+    it('should ignore polluted proxy', async function () {
+      this.timeout(10000);
+      Object.prototype.proxy = { protocol: 'http', host: '127.0.0.1', port: 1 };
+      const server = await startEcho();
+      const { port } = server.address();
+      try { const res = await axios.get(`http://127.0.0.1:${port}/`); assert.strictEqual(res.status, 200); } finally { await stop(server); }
+    });
+
+    it('should ignore polluted method', async function () {
+      this.timeout(10000);
+      Object.prototype.method = 'DELETE';
+      const server = await startEcho();
+      const { port } = server.address();
+      try { const res = await axios.get(`http://127.0.0.1:${port}/ok`); assert.strictEqual(res.data.method, 'GET'); } finally { await stop(server); }
+    });
+
+    it('should ignore polluted timeout at the merged config level', function () {
+      Object.prototype.timeout = 1;
+      const merged = mergeConfig({}, { url: '/x' });
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(merged, 'timeout'), false);
+    });
+
+    it('should ignore polluted responseType', async function () {
+      this.timeout(10000);
+      Object.prototype.responseType = 'arraybuffer';
+      const server = await startEcho();
+      const { port } = server.address();
+      try { const res = await axios.get(`http://127.0.0.1:${port}/`); assert.strictEqual(typeof res.data, 'object'); assert.ok(!Buffer.isBuffer(res.data)); } finally { await stop(server); }
     });
   });
 });
