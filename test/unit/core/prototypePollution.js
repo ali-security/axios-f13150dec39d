@@ -23,6 +23,7 @@ describe('Prototype Pollution Protection', function () {
     delete Object.prototype.responseType;
     delete Object.prototype.transitional;
     delete Object.prototype.httpVersion;
+    delete Object.prototype.validateStatus;
   });
 
   describe('utils.merge', function () {
@@ -546,6 +547,37 @@ describe('Prototype Pollution Protection', function () {
         assert.ok(!(res.data instanceof EvilBlob));
       } else {
         assert.ok(error);
+      }
+    });
+  });
+
+  describe('GHSA-w9j2-pvgh-6h63 validateStatus merge', function () {
+    it('should not inherit a polluted validateStatus during mergeConfig', function () {
+      Object.prototype.validateStatus = () => true;
+      const merged = mergeConfig(defaults, { url: '/x' });
+      assert.strictEqual(merged.validateStatus, defaults.validateStatus);
+    });
+
+    it('should keep 4xx/5xx responses rejected when Object.prototype.validateStatus is polluted', async function () {
+      this.timeout(10000);
+      Object.prototype.validateStatus = () => true;
+      const server = http.createServer((req, res) => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{"error":"unauthorized"}');
+      });
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address();
+      try {
+        let threw = false;
+        try {
+          await axios.get(`http://127.0.0.1:${port}/`);
+        } catch (err) {
+          threw = true;
+          assert.strictEqual(err.response.status, 401);
+        }
+        assert.strictEqual(threw, true);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
       }
     });
   });
